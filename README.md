@@ -2,6 +2,8 @@
 
 A **Computer Organization and Assembly Language (COAL)** course project: a Space Invaders–style game implemented entirely in **Intel 8086** assembly using **MASM 6.x**, running as a **16-bit real-mode DOS** program under **DOSBox**.
 
+Demo link: https://youtu.be/J13JrBQTgwM
+
 The project demonstrates low-level topics from computer organization: **memory models**, **segment registers**, **BIOS services** (`INT 10h`, `INT 16h`), **direct mapped video RAM** (colour text mode at segment `B800h`), the **BIOS tick counter** for timing (`0040:006C`), **extended keyboard scan codes**, structured **procedure** layout, and disciplined **register preservation** across calls.
 
 ---
