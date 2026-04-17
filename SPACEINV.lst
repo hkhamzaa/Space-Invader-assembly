@@ -1,0 +1,1099 @@
+Microsoft (R) Macro Assembler Version 6.15.8803		    04/17/26 17:19:53
+SPACEINV.ASM						     Page 1 - 1
+
+
+				; =================================================================
+				;  SPACEINV.ASM   -   Space Invaders (MASM 6.x / Intel 8086 / DOSBox)
+				; -----------------------------------------------------------------
+				;  Strict 8086 real-mode.  80x25 text mode, direct VRAM @ B800h.
+				;  BIOS INT 10h for mode set and cursor, INT 16h for keyboard,
+				;  BIOS tick counter at 0040:006Ch for frame timing.
+				;
+				;  Build:
+				;       masm SPACEINV.ASM;
+				;       link SPACEINV.OBJ;
+				;       SPACEINV
+				;
+				;  Architecture (high level):
+				;       main           - sets mode, runs title/game/gameover states
+				;       TitleScreen    - waits for ENTER
+				;       ResetGame      - re-initialises all game state
+				;       game_loop      - one iteration per BIOS tick (~18 Hz)
+				;           HandleInput        (INT 16h, non-blocking)
+				;           UpdatePlayerBullet (moves the single player bullet up)
+				;           MoveEnemies        (shared offset, bounce left/right)
+				;           UpdateEnemyBullets (moves enemy bullets down)
+				;           SpawnEnemyBullet   (random alive enemy fires)
+				;           CheckCollisions    (player bullet vs enemies,
+				;                               enemy bullets vs player)
+				;           CheckRespawn       (3-second respawn per slot)
+				;           RenderFrame        (clear VRAM, draw HUD/enemies/player/bullets)
+				;       GameOverScreen - waits for R (restart) or Q (quit)
+				; =================================================================
+
+				.MODEL small
+				.8086
+				.STACK 200h
+
+				; ---- constants ---------------------------------------------------
+ = B800				VIDEO_SEG       EQU 0B800h
+ = 0016				PLAYER_ROW      EQU 22
+ = 0003				ENEMY_ROW       EQU 3
+ = 0004				NUM_ENEMIES     EQU 4
+ = 0005				NUM_EBULLETS    EQU 5
+
+ = 0007				ATTR_NORMAL     EQU 07h         ; white on black
+ = 000E				ATTR_PLAYER     EQU 0Eh         ; yellow
+ = 000C				ATTR_ENEMY      EQU 0Ch         ; light red
+ = 000B				ATTR_PBULLET    EQU 0Bh         ; light cyan
+ = 000A				ATTR_EBULLET    EQU 0Ah         ; light green
+ = 000F				ATTR_HUD        EQU 0Fh         ; bright white
+ = 000E				ATTR_TITLE      EQU 0Eh         ; yellow
+ = 000C				ATTR_GOVER      EQU 0Ch         ; light red
+
+ = 004B				KEY_LEFT        EQU 4Bh
+ = 004D				KEY_RIGHT       EQU 4Dh
+ = 0039				KEY_SPACE       EQU 39h
+ = 0010				KEY_Q           EQU 10h
+ = 0013				KEY_R           EQU 13h
+ = 001C				KEY_ENTER       EQU 1Ch
+
+ = 0004				ENEMY_MOVE_RATE EQU 4            ; enemies step every 4 frames
+ = 000C				ENEMY_FIRE_RATE EQU 12           ; enemy bullet spawn every 12 frames
+ = 0036				RESPAWN_FRAMES  EQU 54           ; ~3 seconds at 18.2 Hz
+
+				; ---- data --------------------------------------------------------
+ 0000				.DATA
+
+ 0000 28			player_x        db 40
+ 0001 00			player_bx       db 0
+ 0002 00			player_by       db 0
+ 0003 00			player_b_act    db 0
+
+ 0004 0A 1E 32 46		enemy_base_x    db 10, 30, 50, 70
+ 0008 01 01 01 01		enemy_alive     db 1, 1, 1, 1
+ 000C 00 00 00 00		enemy_resp_t    db 0, 0, 0, 0
+ 0010 00			enemy_ofs       db 0             ; signed horizontal offset
+ 0011 01			enemy_dir       db 1             ; +1 or -1
+ 0012 00			enemy_mv_timer  db 0
+ 0013 00			enemy_fr_timer  db 0
+
+ 0014 00 00 00 00 00		ebull_x         db 0,0,0,0,0
+ 0019 00 00 00 00 00		ebull_y         db 0,0,0,0,0
+ 001E 00 00 00 00 00		ebull_act       db 0,0,0,0,0
+
+ 0023 03			score           db 3
+ 0024 00			want_quit       db 0
+ 0025 00			want_restart    db 0
+
+ 0026 BEEF			rand_seed       dw 0BEEFh
+ 0028 0000			last_tick       dw 0
+
+ 002A 53 50 41 43 45 20		m_title         db 'SPACE INVADERS',0
+       49 4E 56 41 44 45
+       52 53 00
+ 0039 4C 65 66 74 20 41		m_ctl1          db 'Left Arrow  = Move Left',0
+       72 72 6F 77 20 20
+       3D 20 4D 6F 76 65
+       20 4C 65 66 74 00
+ 0051 52 69 67 68 74 20		m_ctl2          db 'Right Arrow = Move Right',0
+       41 72 72 6F 77 20
+       3D 20 4D 6F 76 65
+       20 52 69 67 68 74
+       00
+ 006A 53 70 61 63 65 20		m_ctl3          db 'Space       = Fire',0
+       20 20 20 20 20 20
+       3D 20 46 69 72 65
+       00
+ 007D 51 20 20 20 20 20		m_ctl4          db 'Q           = Quit',0
+       20 20 20 20 20 20
+       3D 20 51 75 69 74
+       00
+ 0090 50 72 65 73 73 20		m_press         db 'Press ENTER to Start',0
+       45 4E 54 45 52 20
+       74 6F 20 53 74 61
+       72 74 00
+ 00A5 53 63 6F 72 65 3A		m_score         db 'Score: ',0
+       20 00
+ 00AD 47 41 4D 45 20 4F		m_gover         db 'GAME OVER',0
+       56 45 52 00
+ 00B7 46 69 6E 61 6C 20		m_final         db 'Final Score: ',0
+       53 63 6F 72 65 3A
+       20 00
+ 00C5 52 20 3D 20 52 65		m_opts          db 'R = Restart     Q = Quit',0
+       73 74 61 72 74 20
+       20 20 20 20 51 20
+       3D 20 51 75 69 74
+       00
+
+				; ---- code --------------------------------------------------------
+ 0000				.CODE
+
+				; =================================================================
+				;  main
+				; =================================================================
+ 0000				main PROC
+ 0000  B8 ---- R		        mov     ax, @data
+SPACEINV.ASM(106) : error A2118: cannot have segment address references with TINY model
+ 0003  8E D8			        mov     ds, ax
+
+ 0005  B8 0003			        mov     ax, 0003h       ; 80x25 colour text, clear screen
+ 0008  CD 10			        int     10h
+ 000A  E8 0056			        call    HideCursor
+
+ 000D				main_start:
+ 000D  E8 0433			        call    TitleScreen
+ 0010  80 3E 0024 R 01		        cmp     want_quit, 1
+ 0015  74 3F			        je      quit_game
+
+ 0017				play_start:
+ 0017  E8 02F9			        call    ResetGame
+
+ 001A				game_loop:
+ 001A  E8 005E			        call    WaitTick
+ 001D  E8 00E3			        call    HandleInput
+ 0020  80 3E 0024 R 01		        cmp     want_quit, 1
+ 0025  74 2F			        je      quit_game
+
+ 0027  E8 0140			        call    UpdatePlayerBullet
+ 002A  E8 017C			        call    MoveEnemies
+ 002D  E8 0152			        call    UpdateEnemyBullets
+ 0030  E8 01CA			        call    SpawnEnemyBullet
+ 0033  E8 0225			        call    CheckCollisions
+ 0036  E8 02AD			        call    CheckRespawn
+ 0039  E8 0340			        call    RenderFrame
+
+ 003C  80 3E 0023 R 00		        cmp     score, 0
+ 0041  7F D7			        jg      game_loop
+
+ 0043  E8 0466			        call    GameOverScreen
+ 0046  80 3E 0024 R 01		        cmp     want_quit, 1
+ 004B  74 09			        je      quit_game
+ 004D  80 3E 0025 R 01		        cmp     want_restart, 1
+ 0052  74 C3			        je      play_start
+ 0054  EB B7			        jmp     main_start
+
+ 0056				quit_game:
+ 0056  E8 0016			        call    ShowCursor
+ 0059  B8 0003			        mov     ax, 0003h
+ 005C  CD 10			        int     10h
+ 005E  B8 4C00			        mov     ax, 4C00h
+ 0061  CD 21			        int     21h
+ 0063				main ENDP
+
+				; =================================================================
+				;  HideCursor / ShowCursor
+				; =================================================================
+ 0063				HideCursor PROC
+ 0063  50			        push    ax
+ 0064  51			        push    cx
+ 0065  B4 01			        mov     ah, 01h
+ 0067  B9 2607			        mov     cx, 2607h        ; bit 5 of CH => cursor off
+ 006A  CD 10			        int     10h
+ 006C  59			        pop     cx
+ 006D  58			        pop     ax
+ 006E  C3			        ret
+ 006F				HideCursor ENDP
+
+ 006F				ShowCursor PROC
+ 006F  50			        push    ax
+ 0070  51			        push    cx
+ 0071  B4 01			        mov     ah, 01h
+ 0073  B9 0607			        mov     cx, 0607h        ; standard scan lines
+ 0076  CD 10			        int     10h
+ 0078  59			        pop     cx
+ 0079  58			        pop     ax
+ 007A  C3			        ret
+ 007B				ShowCursor ENDP
+
+				; =================================================================
+				;  WaitTick - blocks until BIOS tick counter changes (~18 Hz)
+				; =================================================================
+ 007B				WaitTick PROC
+ 007B  50			        push    ax
+ 007C  06			        push    es
+ 007D				wt_loop:
+ 007D  33 C0			        xor     ax, ax
+ 007F  8E C0			        mov     es, ax
+ 0081  26: A1 046C		        mov     ax, es:[046Ch]
+ 0085  3B 06 0028 R		        cmp     ax, last_tick
+ 0089  74 F2			        je      wt_loop
+ 008B  A3 0028 R		        mov     last_tick, ax
+ 008E  07			        pop     es
+ 008F  58			        pop     ax
+ 0090  C3			        ret
+ 0091				WaitTick ENDP
+
+				; =================================================================
+				;  ClearScreen - fills B800h with space char, normal attribute
+				; =================================================================
+ 0091				ClearScreen PROC
+ 0091  50			        push    ax
+ 0092  51			        push    cx
+ 0093  57			        push    di
+ 0094  06			        push    es
+ 0095  B8 B800			        mov     ax, VIDEO_SEG
+ 0098  8E C0			        mov     es, ax
+ 009A  33 FF			        xor     di, di
+ 009C  B8 0720			        mov     ax, 0720h        ; attr 07h + space (20h)
+ 009F  B9 07D0			        mov     cx, 2000         ; 80*25 cells
+ 00A2  FC			        cld
+ 00A3  F3/ AB			        rep     stosw
+ 00A5  07			        pop     es
+ 00A6  5F			        pop     di
+ 00A7  59			        pop     cx
+ 00A8  58			        pop     ax
+ 00A9  C3			        ret
+ 00AA				ClearScreen ENDP
+
+				; =================================================================
+				;  PutChar - draw a single character
+				;  In: DL=col, DH=row, AL=char, BH=attribute
+				;  Preserves all registers.
+				; =================================================================
+ 00AA				PutChar PROC
+ 00AA  50			        push    ax
+ 00AB  53			        push    bx
+ 00AC  51			        push    cx
+ 00AD  52			        push    dx
+ 00AE  57			        push    di
+ 00AF  06			        push    es
+ 00B0  8A D8			        mov     bl, al           ; BX = attr:char
+ 00B2  8A C6			        mov     al, dh
+ 00B4  B1 50			        mov     cl, 80
+ 00B6  F6 E1			        mul     cl               ; AX = row*80
+ 00B8  8A CA			        mov     cl, dl
+ 00BA  32 ED			        xor     ch, ch
+ 00BC  03 C1			        add     ax, cx           ; AX = row*80 + col
+ 00BE  D1 E0			        shl     ax, 1            ; *2 bytes per cell
+ 00C0  8B F8			        mov     di, ax
+ 00C2  B8 B800			        mov     ax, VIDEO_SEG
+ 00C5  8E C0			        mov     es, ax
+ 00C7  26: 89 1D		        mov     es:[di], bx
+ 00CA  07			        pop     es
+ 00CB  5F			        pop     di
+ 00CC  5A			        pop     dx
+ 00CD  59			        pop     cx
+ 00CE  5B			        pop     bx
+ 00CF  58			        pop     ax
+ 00D0  C3			        ret
+ 00D1				PutChar ENDP
+
+				; =================================================================
+				;  DrawString
+				;  In: DL=col, DH=row, SI=ASCIZ string, BH=attribute
+				; =================================================================
+ 00D1				DrawString PROC
+ 00D1  50			        push    ax
+ 00D2  52			        push    dx
+ 00D3  56			        push    si
+ 00D4				ds_loop:
+ 00D4  8A 04			        mov     al, [si]
+ 00D6  0A C0			        or      al, al
+ 00D8  74 08			        jz      ds_done
+ 00DA  E8 FFCD			        call    PutChar
+ 00DD  46			        inc     si
+ 00DE  FE C2			        inc     dl
+ 00E0  EB F2			        jmp     ds_loop
+ 00E2				ds_done:
+ 00E2  5E			        pop     si
+ 00E3  5A			        pop     dx
+ 00E4  58			        pop     ax
+ 00E5  C3			        ret
+ 00E6				DrawString ENDP
+
+				; =================================================================
+				;  DrawNum2 - print AL as 2-digit decimal
+				;  In: DL=col, DH=row, AL=num (0..99), BH=attribute
+				; =================================================================
+ 00E6				DrawNum2 PROC
+ 00E6  50			        push    ax
+ 00E7  51			        push    cx
+ 00E8  52			        push    dx
+ 00E9  32 E4			        xor     ah, ah
+ 00EB  B1 0A			        mov     cl, 10
+ 00ED  F6 F1			        div     cl               ; AL=tens, AH=ones
+ 00EF  50			        push    ax
+ 00F0  04 30			        add     al, '0'
+ 00F2  E8 FFB5			        call    PutChar
+ 00F5  FE C2			        inc     dl
+ 00F7  58			        pop     ax
+ 00F8  8A C4			        mov     al, ah
+ 00FA  04 30			        add     al, '0'
+ 00FC  E8 FFAB			        call    PutChar
+ 00FF  5A			        pop     dx
+ 0100  59			        pop     cx
+ 0101  58			        pop     ax
+ 0102  C3			        ret
+ 0103				DrawNum2 ENDP
+
+				; =================================================================
+				;  HandleInput - drains the keyboard buffer (non-blocking)
+				; =================================================================
+ 0103				HandleInput PROC
+ 0103  50			        push    ax
+ 0104				hi_loop:
+ 0104  B4 01			        mov     ah, 01h
+ 0106  CD 16			        int     16h
+ 0108  74 5E			        jz      hi_done
+ 010A  B4 00			        mov     ah, 00h
+ 010C  CD 16			        int     16h
+
+ 010E  80 FC 4B			        cmp     ah, KEY_LEFT
+ 0111  74 1D			        je      hi_left
+ 0113  80 FC 4D			        cmp     ah, KEY_RIGHT
+ 0116  74 25			        je      hi_right
+ 0118  80 FC 39			        cmp     ah, KEY_SPACE
+ 011B  74 2D			        je      hi_fire
+ 011D  3C 20			        cmp     al, ' '
+ 011F  74 29			        je      hi_fire
+ 0121  80 FC 10			        cmp     ah, KEY_Q
+ 0124  74 3D			        je      hi_quit
+ 0126  3C 71			        cmp     al, 'q'
+ 0128  74 39			        je      hi_quit
+ 012A  3C 51			        cmp     al, 'Q'
+ 012C  74 35			        je      hi_quit
+ 012E  EB D4			        jmp     hi_loop
+
+ 0130				hi_left:
+ 0130  80 3E 0000 R 02		        cmp     byte ptr player_x, 2
+ 0135  76 CD			        jbe     hi_loop
+ 0137  FE 0E 0000 R		        dec     byte ptr player_x
+ 013B  EB C7			        jmp     hi_loop
+
+ 013D				hi_right:
+ 013D  80 3E 0000 R 4D		        cmp     byte ptr player_x, 77
+ 0142  73 C0			        jae     hi_loop
+ 0144  FE 06 0000 R		        inc     byte ptr player_x
+ 0148  EB BA			        jmp     hi_loop
+
+ 014A				hi_fire:
+ 014A  80 3E 0003 R 01		        cmp     byte ptr player_b_act, 1
+ 014F  74 B3			        je      hi_loop
+ 0151  A0 0000 R		        mov     al, player_x
+ 0154  A2 0001 R		        mov     player_bx, al
+ 0157  B0 15			        mov     al, PLAYER_ROW - 1
+ 0159  A2 0002 R		        mov     player_by, al
+ 015C  C6 06 0003 R 01		        mov     byte ptr player_b_act, 1
+ 0161  EB A1			        jmp     hi_loop
+
+ 0163				hi_quit:
+ 0163  C6 06 0024 R 01		        mov     byte ptr want_quit, 1
+ 0168				hi_done:
+ 0168  58			        pop     ax
+ 0169  C3			        ret
+ 016A				HandleInput ENDP
+
+				; =================================================================
+				;  UpdatePlayerBullet - bullet ascends one row per frame
+				; =================================================================
+ 016A				UpdatePlayerBullet PROC
+ 016A  80 3E 0003 R 00		        cmp     byte ptr player_b_act, 0
+ 016F  74 10			        je      upb_done
+ 0171  FE 0E 0002 R		        dec     byte ptr player_by
+ 0175  80 3E 0002 R 01		        cmp     byte ptr player_by, 1
+ 017A  73 05			        jae     upb_done
+ 017C  C6 06 0003 R 00		        mov     byte ptr player_b_act, 0
+ 0181				upb_done:
+ 0181  C3			        ret
+ 0182				UpdatePlayerBullet ENDP
+
+				; =================================================================
+				;  UpdateEnemyBullets - descend one row per frame
+				; =================================================================
+ 0182				UpdateEnemyBullets PROC
+ 0182  50			        push    ax
+ 0183  56			        push    si
+ 0184  33 F6			        xor     si, si
+ 0186				ueb_loop:
+ 0186  83 FE 05			        cmp     si, NUM_EBULLETS
+ 0189  73 1B			        jae     ueb_done
+ 018B  80 BC 001E R 00		        cmp     byte ptr [ebull_act + si], 0
+ 0190  74 11			        je      ueb_next
+ 0192  FE 84 0019 R		        inc     byte ptr [ebull_y + si]
+ 0196  8A 84 0019 R		        mov     al, [ebull_y + si]
+ 019A  3C 18			        cmp     al, 24
+ 019C  72 05			        jb      ueb_next
+ 019E  C6 84 001E R 00		        mov     byte ptr [ebull_act + si], 0
+ 01A3				ueb_next:
+ 01A3  46			        inc     si
+ 01A4  EB E0			        jmp     ueb_loop
+ 01A6				ueb_done:
+ 01A6  5E			        pop     si
+ 01A7  58			        pop     ax
+ 01A8  C3			        ret
+ 01A9				UpdateEnemyBullets ENDP
+
+				; =================================================================
+				;  MoveEnemies - shared horizontal offset, bounce at edges.
+				;  Enemies NEVER move vertically.
+				; =================================================================
+ 01A9				MoveEnemies PROC
+ 01A9  50			        push    ax
+ 01AA  53			        push    bx
+ 01AB  FE 06 0012 R		        inc     byte ptr enemy_mv_timer
+ 01AF  A0 0012 R		        mov     al, enemy_mv_timer
+ 01B2  3C 04			        cmp     al, ENEMY_MOVE_RATE
+ 01B4  72 31			        jb      me_done
+ 01B6  C6 06 0012 R 00		        mov     byte ptr enemy_mv_timer, 0
+
+ 01BB  A0 0010 R		        mov     al, enemy_ofs
+ 01BE  8A 1E 0011 R		        mov     bl, enemy_dir
+ 01C2  02 C3			        add     al, bl
+ 01C4  3C 09			        cmp     al, 9                    ; OFS_MAX
+ 01C6  7E 0D			        jle     me_check_min
+ 01C8  F6 DB			        neg     bl                       ; hit right edge - reverse
+ 01CA  88 1E 0011 R		        mov     enemy_dir, bl
+ 01CE  A0 0010 R		        mov     al, enemy_ofs
+ 01D1  02 C3			        add     al, bl
+ 01D3  EB 0F			        jmp     me_store
+ 01D5				me_check_min:
+ 01D5  3C F7			        cmp     al, -9                   ; OFS_MIN
+ 01D7  7D 0B			        jge     me_store
+ 01D9  F6 DB			        neg     bl                       ; hit left edge - reverse
+ 01DB  88 1E 0011 R		        mov     enemy_dir, bl
+ 01DF  A0 0010 R		        mov     al, enemy_ofs
+ 01E2  02 C3			        add     al, bl
+ 01E4				me_store:
+ 01E4  A2 0010 R		        mov     enemy_ofs, al
+ 01E7				me_done:
+ 01E7  5B			        pop     bx
+ 01E8  58			        pop     ax
+ 01E9  C3			        ret
+ 01EA				MoveEnemies ENDP
+
+				; =================================================================
+				;  Rand - 16-bit LCG, result in AX
+				; =================================================================
+ 01EA				Rand PROC
+ 01EA  53			        push    bx
+ 01EB  52			        push    dx
+ 01EC  A1 0026 R		        mov     ax, rand_seed
+ 01EF  BB 6255			        mov     bx, 25173
+ 01F2  F7 E3			        mul     bx
+ 01F4  05 3619			        add     ax, 13849
+ 01F7  A3 0026 R		        mov     rand_seed, ax
+ 01FA  5A			        pop     dx
+ 01FB  5B			        pop     bx
+ 01FC  C3			        ret
+ 01FD				Rand ENDP
+
+				; =================================================================
+				;  SpawnEnemyBullet - periodically have a random alive enemy fire
+				; =================================================================
+ 01FD				SpawnEnemyBullet PROC
+ 01FD  50			        push    ax
+ 01FE  53			        push    bx
+ 01FF  51			        push    cx
+ 0200  56			        push    si
+ 0201  FE 06 0013 R		        inc     byte ptr enemy_fr_timer
+ 0205  A0 0013 R		        mov     al, enemy_fr_timer
+ 0208  3C 0C			        cmp     al, ENEMY_FIRE_RATE
+ 020A  72 4A			        jb      seb_done
+ 020C  C6 06 0013 R 00		        mov     byte ptr enemy_fr_timer, 0
+
+ 0211  33 F6			        xor     si, si
+ 0213				seb_find:
+ 0213  83 FE 05			        cmp     si, NUM_EBULLETS
+ 0216  73 3E			        jae     seb_done                 ; no free bullet slot
+ 0218  80 BC 001E R 00		        cmp     byte ptr [ebull_act + si], 0
+ 021D  74 03			        je      seb_got_slot
+ 021F  46			        inc     si
+ 0220  EB F1			        jmp     seb_find
+
+ 0222				seb_got_slot:
+ 0222  E8 FFC5			        call    Rand
+ 0225  83 E0 03			        and     ax, 3
+ 0228  8B D8			        mov     bx, ax
+ 022A  B9 0004			        mov     cx, NUM_ENEMIES
+ 022D				seb_find_alive:
+ 022D  0B C9			        or      cx, cx
+ 022F  74 25			        jz      seb_done                 ; no enemies alive
+ 0231  80 BF 0008 R 00		        cmp     byte ptr [enemy_alive + bx], 0
+ 0236  75 07			        jne     seb_alive_found
+ 0238  43			        inc     bx
+ 0239  83 E3 03			        and     bx, 3
+ 023C  49			        dec     cx
+ 023D  EB EE			        jmp     seb_find_alive
+
+ 023F				seb_alive_found:
+ 023F  8A 87 0004 R		        mov     al, [enemy_base_x + bx]
+ 0243  02 06 0010 R		        add     al, enemy_ofs
+ 0247  88 84 0014 R		        mov     [ebull_x + si], al
+ 024B  B0 04			        mov     al, ENEMY_ROW + 1
+ 024D  88 84 0019 R		        mov     [ebull_y + si], al
+ 0251  C6 84 001E R 01		        mov     byte ptr [ebull_act + si], 1
+ 0256				seb_done:
+ 0256  5E			        pop     si
+ 0257  59			        pop     cx
+ 0258  5B			        pop     bx
+ 0259  58			        pop     ax
+ 025A  C3			        ret
+ 025B				SpawnEnemyBullet ENDP
+
+				; =================================================================
+				;  CheckCollisions
+				;   A) player bullet at row ENEMY_ROW vs any alive enemy
+				;   B) each enemy bullet at PLAYER_ROW vs the 3-char player sprite
+				; =================================================================
+ 025B				CheckCollisions PROC
+ 025B  50			        push    ax
+ 025C  53			        push    bx
+ 025D  52			        push    dx
+ 025E  56			        push    si
+
+				        ; --- A: player bullet vs enemies ---
+ 025F  80 3E 0003 R 00		        cmp     byte ptr player_b_act, 0
+ 0264  74 3D			        je      cc_ebulls
+ 0266  A0 0002 R		        mov     al, player_by
+ 0269  3C 03			        cmp     al, ENEMY_ROW
+ 026B  75 36			        jne     cc_ebulls
+ 026D  8A 16 0001 R		        mov     dl, player_bx
+ 0271  33 F6			        xor     si, si
+ 0273				cc_e_loop:
+ 0273  83 FE 04			        cmp     si, NUM_ENEMIES
+ 0276  73 2B			        jae     cc_ebulls
+ 0278  80 BC 0008 R 00		        cmp     byte ptr [enemy_alive + si], 0
+ 027D  74 21			        je      cc_e_next
+ 027F  8A 84 0004 R		        mov     al, [enemy_base_x + si]
+ 0283  02 06 0010 R		        add     al, enemy_ofs
+ 0287  38 D0			        cmp     al, dl
+ 0289  75 15			        jne     cc_e_next
+				        ; HIT
+ 028B  C6 84 0008 R 00		        mov     byte ptr [enemy_alive + si], 0
+ 0290  C6 84 000C R 36		        mov     byte ptr [enemy_resp_t + si], RESPAWN_FRAMES
+ 0295  C6 06 0003 R 00		        mov     byte ptr player_b_act, 0
+ 029A  FE 06 0023 R		        inc     byte ptr score
+ 029E  EB 03			        jmp     cc_ebulls
+ 02A0				cc_e_next:
+ 02A0  46			        inc     si
+ 02A1  EB D0			        jmp     cc_e_loop
+
+				        ; --- B: enemy bullets vs player ---
+ 02A3				cc_ebulls:
+ 02A3  33 F6			        xor     si, si
+ 02A5				cc_p_loop:
+ 02A5  83 FE 05			        cmp     si, NUM_EBULLETS
+ 02A8  73 37			        jae     cc_done
+ 02AA  80 BC 001E R 00		        cmp     byte ptr [ebull_act + si], 0
+ 02AF  74 2D			        je      cc_p_next
+ 02B1  8A 84 0019 R		        mov     al, [ebull_y + si]
+ 02B5  3C 16			        cmp     al, PLAYER_ROW
+ 02B7  75 25			        jne     cc_p_next
+ 02B9  8A 84 0014 R		        mov     al, [ebull_x + si]
+ 02BD  8A 1E 0000 R		        mov     bl, player_x
+ 02C1  FE CB			        dec     bl                       ; left edge of sprite
+ 02C3  38 D8			        cmp     al, bl
+ 02C5  72 17			        jb      cc_p_next
+ 02C7  80 C3 02			        add     bl, 2                    ; right edge of sprite
+ 02CA  38 D8			        cmp     al, bl
+ 02CC  77 10			        ja      cc_p_next
+				        ; HIT
+ 02CE  C6 84 001E R 00		        mov     byte ptr [ebull_act + si], 0
+ 02D3  80 3E 0023 R 01		        cmp     byte ptr score, 1
+ 02D8  7C 04			        jl      cc_p_next                ; already at zero, skip dec
+ 02DA  FE 0E 0023 R		        dec     byte ptr score
+ 02DE				cc_p_next:
+ 02DE  46			        inc     si
+ 02DF  EB C4			        jmp     cc_p_loop
+ 02E1				cc_done:
+ 02E1  5E			        pop     si
+ 02E2  5A			        pop     dx
+ 02E3  5B			        pop     bx
+ 02E4  58			        pop     ax
+ 02E5  C3			        ret
+ 02E6				CheckCollisions ENDP
+
+				; =================================================================
+				;  CheckRespawn - tick down respawn timers, revive when 0
+				; =================================================================
+ 02E6				CheckRespawn PROC
+ 02E6  50			        push    ax
+ 02E7  56			        push    si
+ 02E8  33 F6			        xor     si, si
+ 02EA				cr_loop:
+ 02EA  83 FE 04			        cmp     si, NUM_ENEMIES
+ 02ED  73 21			        jae     cr_done
+ 02EF  80 BC 0008 R 01		        cmp     byte ptr [enemy_alive + si], 1
+ 02F4  74 17			        je      cr_next
+ 02F6  80 BC 000C R 00		        cmp     byte ptr [enemy_resp_t + si], 0
+ 02FB  74 10			        je      cr_next
+ 02FD  FE 8C 000C R		        dec     byte ptr [enemy_resp_t + si]
+ 0301  80 BC 000C R 00		        cmp     byte ptr [enemy_resp_t + si], 0
+ 0306  75 05			        jne     cr_next
+ 0308  C6 84 0008 R 01		        mov     byte ptr [enemy_alive + si], 1
+ 030D				cr_next:
+ 030D  46			        inc     si
+ 030E  EB DA			        jmp     cr_loop
+ 0310				cr_done:
+ 0310  5E			        pop     si
+ 0311  58			        pop     ax
+ 0312  C3			        ret
+ 0313				CheckRespawn ENDP
+
+				; =================================================================
+				;  ResetGame - full reset of every piece of state
+				; =================================================================
+ 0313				ResetGame PROC
+ 0313  50			        push    ax
+ 0314  56			        push    si
+ 0315  C6 06 0000 R 28		        mov     byte ptr player_x,       40
+ 031A  C6 06 0003 R 00		        mov     byte ptr player_b_act,   0
+ 031F  C6 06 0001 R 00		        mov     byte ptr player_bx,      0
+ 0324  C6 06 0002 R 00		        mov     byte ptr player_by,      0
+ 0329  C6 06 0023 R 03		        mov     byte ptr score,          3
+ 032E  C6 06 0010 R 00		        mov     byte ptr enemy_ofs,      0
+ 0333  C6 06 0011 R 01		        mov     byte ptr enemy_dir,      1
+ 0338  C6 06 0012 R 00		        mov     byte ptr enemy_mv_timer, 0
+ 033D  C6 06 0013 R 00		        mov     byte ptr enemy_fr_timer, 0
+ 0342  C6 06 0024 R 00		        mov     byte ptr want_quit,      0
+ 0347  C6 06 0025 R 00		        mov     byte ptr want_restart,   0
+
+ 034C  33 F6			        xor     si, si
+ 034E				rg_e:
+ 034E  83 FE 04			        cmp     si, NUM_ENEMIES
+ 0351  73 0D			        jae     rg_e_end
+ 0353  C6 84 0008 R 01		        mov     byte ptr [enemy_alive  + si], 1
+ 0358  C6 84 000C R 00		        mov     byte ptr [enemy_resp_t + si], 0
+ 035D  46			        inc     si
+ 035E  EB EE			        jmp     rg_e
+ 0360				rg_e_end:
+
+ 0360  33 F6			        xor     si, si
+ 0362				rg_b:
+ 0362  83 FE 05			        cmp     si, NUM_EBULLETS
+ 0365  73 12			        jae     rg_b_end
+ 0367  C6 84 001E R 00		        mov     byte ptr [ebull_act + si], 0
+ 036C  C6 84 0014 R 00		        mov     byte ptr [ebull_x   + si], 0
+ 0371  C6 84 0019 R 00		        mov     byte ptr [ebull_y   + si], 0
+ 0376  46			        inc     si
+ 0377  EB E9			        jmp     rg_b
+ 0379				rg_b_end:
+ 0379  5E			        pop     si
+ 037A  58			        pop     ax
+ 037B  C3			        ret
+ 037C				ResetGame ENDP
+
+				; =================================================================
+				;  RenderFrame - clear and repaint everything
+				; =================================================================
+ 037C				RenderFrame PROC
+ 037C  E8 FD12			        call    ClearScreen
+ 037F  E8 000A			        call    DrawHUD
+ 0382  E8 002E			        call    DrawEnemies
+ 0385  E8 0058			        call    DrawPlayer
+ 0388  E8 0079			        call    DrawBullets
+ 038B  C3			        ret
+ 038C				RenderFrame ENDP
+
+				; ---- DrawHUD -----------------------------------------------------
+ 038C				DrawHUD PROC
+ 038C  50			        push    ax
+ 038D  53			        push    bx
+ 038E  52			        push    dx
+ 038F  56			        push    si
+ 0390  B7 0F			        mov     bh, ATTR_HUD
+ 0392  B2 02			        mov     dl, 2
+ 0394  B6 00			        mov     dh, 0
+ 0396  BE 00A5 R		        mov     si, OFFSET m_score
+ 0399  E8 FD35			        call    DrawString
+ 039C  B2 09			        mov     dl, 9
+ 039E  B6 00			        mov     dh, 0
+ 03A0  A0 0023 R		        mov     al, score
+ 03A3  3C 00			        cmp     al, 0
+ 03A5  7D 02			        jge     dh_ok
+ 03A7  32 C0			        xor     al, al
+ 03A9				dh_ok:
+ 03A9  B7 0F			        mov     bh, ATTR_HUD
+ 03AB  E8 FD38			        call    DrawNum2
+ 03AE  5E			        pop     si
+ 03AF  5A			        pop     dx
+ 03B0  5B			        pop     bx
+ 03B1  58			        pop     ax
+ 03B2  C3			        ret
+ 03B3				DrawHUD ENDP
+
+				; ---- DrawEnemies -------------------------------------------------
+ 03B3				DrawEnemies PROC
+ 03B3  50			        push    ax
+ 03B4  53			        push    bx
+ 03B5  52			        push    dx
+ 03B6  56			        push    si
+ 03B7  33 F6			        xor     si, si
+ 03B9				de_loop:
+ 03B9  83 FE 04			        cmp     si, NUM_ENEMIES
+ 03BC  73 1D			        jae     de_done
+ 03BE  80 BC 0008 R 00		        cmp     byte ptr [enemy_alive + si], 0
+ 03C3  74 13			        je      de_next
+ 03C5  8A 84 0004 R		        mov     al, [enemy_base_x + si]
+ 03C9  02 06 0010 R		        add     al, enemy_ofs
+ 03CD  8A D0			        mov     dl, al
+ 03CF  B6 03			        mov     dh, ENEMY_ROW
+ 03D1  B0 57			        mov     al, 'W'
+ 03D3  B7 0C			        mov     bh, ATTR_ENEMY
+ 03D5  E8 FCD2			        call    PutChar
+ 03D8				de_next:
+ 03D8  46			        inc     si
+ 03D9  EB DE			        jmp     de_loop
+ 03DB				de_done:
+ 03DB  5E			        pop     si
+ 03DC  5A			        pop     dx
+ 03DD  5B			        pop     bx
+ 03DE  58			        pop     ax
+ 03DF  C3			        ret
+ 03E0				DrawEnemies ENDP
+
+				; ---- DrawPlayer - 3-char sprite "[A]" centred on player_x --------
+ 03E0				DrawPlayer PROC
+ 03E0  50			        push    ax
+ 03E1  53			        push    bx
+ 03E2  52			        push    dx
+ 03E3  B7 0E			        mov     bh, ATTR_PLAYER
+ 03E5  B6 16			        mov     dh, PLAYER_ROW
+ 03E7  8A 16 0000 R		        mov     dl, player_x
+ 03EB  FE CA			        dec     dl
+ 03ED  B0 5B			        mov     al, '['
+ 03EF  E8 FCB8			        call    PutChar
+ 03F2  FE C2			        inc     dl
+ 03F4  B0 41			        mov     al, 'A'
+ 03F6  E8 FCB1			        call    PutChar
+ 03F9  FE C2			        inc     dl
+ 03FB  B0 5D			        mov     al, ']'
+ 03FD  E8 FCAA			        call    PutChar
+ 0400  5A			        pop     dx
+ 0401  5B			        pop     bx
+ 0402  58			        pop     ax
+ 0403  C3			        ret
+ 0404				DrawPlayer ENDP
+
+				; ---- DrawBullets -------------------------------------------------
+ 0404				DrawBullets PROC
+ 0404  50			        push    ax
+ 0405  53			        push    bx
+ 0406  52			        push    dx
+ 0407  56			        push    si
+ 0408  80 3E 0003 R 00		        cmp     byte ptr player_b_act, 0
+ 040D  74 0F			        je      db_no_pb
+ 040F  8A 16 0001 R		        mov     dl, player_bx
+ 0413  8A 36 0002 R		        mov     dh, player_by
+ 0417  B0 7C			        mov     al, '|'
+ 0419  B7 0B			        mov     bh, ATTR_PBULLET
+ 041B  E8 FC8C			        call    PutChar
+ 041E				db_no_pb:
+ 041E  33 F6			        xor     si, si
+ 0420				db_eloop:
+ 0420  83 FE 05			        cmp     si, NUM_EBULLETS
+ 0423  73 19			        jae     db_edone
+ 0425  80 BC 001E R 00		        cmp     byte ptr [ebull_act + si], 0
+ 042A  74 0F			        je      db_enext
+ 042C  8A 94 0014 R		        mov     dl, [ebull_x + si]
+ 0430  8A B4 0019 R		        mov     dh, [ebull_y + si]
+ 0434  B0 7C			        mov     al, '|'
+ 0436  B7 0A			        mov     bh, ATTR_EBULLET
+ 0438  E8 FC6F			        call    PutChar
+ 043B				db_enext:
+ 043B  46			        inc     si
+ 043C  EB E2			        jmp     db_eloop
+ 043E				db_edone:
+ 043E  5E			        pop     si
+ 043F  5A			        pop     dx
+ 0440  5B			        pop     bx
+ 0441  58			        pop     ax
+ 0442  C3			        ret
+ 0443				DrawBullets ENDP
+
+				; =================================================================
+				;  TitleScreen - blocks until ENTER (or Q to quit)
+				; =================================================================
+ 0443				TitleScreen PROC
+ 0443  50			        push    ax
+ 0444  53			        push    bx
+ 0445  52			        push    dx
+ 0446  56			        push    si
+ 0447  E8 FC47			        call    ClearScreen
+
+ 044A  B7 0E			        mov     bh, ATTR_TITLE
+ 044C  B6 07			        mov     dh, 7
+ 044E  B2 21			        mov     dl, 33                   ; centre of 14-char title
+ 0450  BE 002A R		        mov     si, OFFSET m_title
+ 0453  E8 FC7B			        call    DrawString
+
+ 0456  B7 0F			        mov     bh, ATTR_HUD
+ 0458  B6 0B			        mov     dh, 11
+ 045A  B2 1C			        mov     dl, 28
+ 045C  BE 0039 R		        mov     si, OFFSET m_ctl1
+ 045F  E8 FC6F			        call    DrawString
+ 0462  B6 0C			        mov     dh, 12
+ 0464  BE 0051 R		        mov     si, OFFSET m_ctl2
+ 0467  E8 FC67			        call    DrawString
+ 046A  B6 0D			        mov     dh, 13
+ 046C  BE 006A R		        mov     si, OFFSET m_ctl3
+ 046F  E8 FC5F			        call    DrawString
+ 0472  B6 0E			        mov     dh, 14
+ 0474  BE 007D R		        mov     si, OFFSET m_ctl4
+ 0477  E8 FC57			        call    DrawString
+
+ 047A  B7 0E			        mov     bh, ATTR_PLAYER
+ 047C  B6 12			        mov     dh, 18
+ 047E  B2 1E			        mov     dl, 30
+ 0480  BE 0090 R		        mov     si, OFFSET m_press
+ 0483  E8 FC4B			        call    DrawString
+
+ 0486				ts_wait:
+ 0486  B4 00			        mov     ah, 00h
+ 0488  CD 16			        int     16h
+ 048A  80 FC 1C			        cmp     ah, KEY_ENTER
+ 048D  74 18			        je      ts_done
+ 048F  3C 0D			        cmp     al, 0Dh
+ 0491  74 14			        je      ts_done
+ 0493  80 FC 10			        cmp     ah, KEY_Q
+ 0496  74 0A			        je      ts_quit
+ 0498  3C 71			        cmp     al, 'q'
+ 049A  74 06			        je      ts_quit
+ 049C  3C 51			        cmp     al, 'Q'
+ 049E  74 02			        je      ts_quit
+ 04A0  EB E4			        jmp     ts_wait
+ 04A2				ts_quit:
+ 04A2  C6 06 0024 R 01		        mov     byte ptr want_quit, 1
+ 04A7				ts_done:
+ 04A7  5E			        pop     si
+ 04A8  5A			        pop     dx
+ 04A9  5B			        pop     bx
+ 04AA  58			        pop     ax
+ 04AB  C3			        ret
+ 04AC				TitleScreen ENDP
+
+				; =================================================================
+				;  GameOverScreen - blocks until R (restart) or Q (quit)
+				; =================================================================
+ 04AC				GameOverScreen PROC
+ 04AC  50			        push    ax
+ 04AD  53			        push    bx
+ 04AE  52			        push    dx
+ 04AF  56			        push    si
+ 04B0  E8 FBDE			        call    ClearScreen
+
+ 04B3  B7 0C			        mov     bh, ATTR_GOVER
+ 04B5  B6 09			        mov     dh, 9
+ 04B7  B2 23			        mov     dl, 35
+ 04B9  BE 00AD R		        mov     si, OFFSET m_gover
+ 04BC  E8 FC12			        call    DrawString
+
+ 04BF  B7 0F			        mov     bh, ATTR_HUD
+ 04C1  B6 0B			        mov     dh, 11
+ 04C3  B2 21			        mov     dl, 33
+ 04C5  BE 00B7 R		        mov     si, OFFSET m_final
+ 04C8  E8 FC06			        call    DrawString
+ 04CB  B2 2E			        mov     dl, 46
+ 04CD  A0 0023 R		        mov     al, score
+ 04D0  3C 00			        cmp     al, 0
+ 04D2  7D 02			        jge     gos_ok
+ 04D4  32 C0			        xor     al, al
+ 04D6				gos_ok:
+ 04D6  B7 0F			        mov     bh, ATTR_HUD
+ 04D8  E8 FC0B			        call    DrawNum2
+
+ 04DB  B7 0E			        mov     bh, ATTR_PLAYER
+ 04DD  B6 0E			        mov     dh, 14
+ 04DF  B2 1C			        mov     dl, 28
+ 04E1  BE 00C5 R		        mov     si, OFFSET m_opts
+ 04E4  E8 FBEA			        call    DrawString
+
+ 04E7				gos_wait:
+ 04E7  B4 00			        mov     ah, 00h
+ 04E9  CD 16			        int     16h
+ 04EB  80 FC 13			        cmp     ah, KEY_R
+ 04EE  74 17        je      gos_restart
+ 04F0  3C 72			        cmp     al, 'r'
+ 04F2  74 13			        je      gos_restart
+ 04F4  3C 52			        cmp     al, 'R'
+ 04F6  74 0F			        je      gos_restart
+ 04F8  80 FC 10			        cmp     ah, KEY_Q
+ 04FB  74 11			        je      gos_quit
+ 04FD  3C 71			        cmp     al, 'q'
+ 04FF  74 0D			        je      gos_quit
+ 0501  3C 51			        cmp     al, 'Q'
+ 0503  74 09			        je      gos_quit
+ 0505  EB E0			        jmp     gos_wait
+ 0507				gos_restart:
+ 0507  C6 06 0025 R 01		        mov     byte ptr want_restart, 1
+ 050C  EB 05			        jmp     gos_done
+ 050E				gos_quit:
+ 050E  C6 06 0024 R 01		        mov     byte ptr want_quit, 1
+ 0513				gos_done:
+ 0513  5E			        pop     si
+ 0514  5A			        pop     dx
+ 0515  5B			        pop     bx
+ 0516  58			        pop     ax
+ 0517  C3			        ret
+ 0518				GameOverScreen ENDP
+
+				END main
+SPACEINV.ASM(900) : error A2117: /AT switch requires the TINY memory model
+Microsoft (R) Macro Assembler Version 6.15.8803		    04/17/26 17:19:53
+SPACEINV.ASM						     Symbols 2 - 1
+
+
+
+
+Segments and Groups:
+
+                N a m e                 Size     Length   Align   Combine Class
+
+DGROUP . . . . . . . . . . . . .	GROUP
+_DATA  . . . . . . . . . . . . .	16 Bit	 00DE	  Word	  Public  'DATA'	
+STACK  . . . . . . . . . . . . .	16 Bit	 0200	  Para	  Stack	  'STACK'	 
+_TEXT  . . . . . . . . . . . . .	16 Bit	 0518	  Word	  Public  'CODE'	
+
+
+Procedures,  parameters and locals:
+
+                N a m e                 Type     Value    Attr
+
+CheckCollisions  . . . . . . . .	P Near	 025B	  _TEXT	Length= 008B Public
+  cc_e_loop  . . . . . . . . . .	L Near	 0273	  _TEXT	
+  cc_e_next  . . . . . . . . . .	L Near	 02A0	  _TEXT	
+  cc_ebulls  . . . . . . . . . .	L Near	 02A3	  _TEXT	
+  cc_p_loop  . . . . . . . . . .	L Near	 02A5	  _TEXT	
+  cc_p_next  . . . . . . . . . .	L Near	 02DE	  _TEXT	
+  cc_done  . . . . . . . . . . .	L Near	 02E1	  _TEXT	
+CheckRespawn . . . . . . . . . .	P Near	 02E6	  _TEXT	Length= 002D Public
+  cr_loop  . . . . . . . . . . .	L Near	 02EA	  _TEXT	
+  cr_next  . . . . . . . . . . .	L Near	 030D	  _TEXT	
+  cr_done  . . . . . . . . . . .	L Near	 0310	  _TEXT	
+ClearScreen  . . . . . . . . . .	P Near	 0091	  _TEXT	Length= 0019 Public
+DrawBullets  . . . . . . . . . .	P Near	 0404	  _TEXT	Length= 003F Public
+  db_no_pb . . . . . . . . . . .	L Near	 041E	  _TEXT	
+  db_eloop . . . . . . . . . . .	L Near	 0420	  _TEXT	
+  db_enext . . . . . . . . . . .	L Near	 043B	  _TEXT	
+  db_edone . . . . . . . . . . .	L Near	 043E	  _TEXT	
+DrawEnemies  . . . . . . . . . .	P Near	 03B3	  _TEXT	Length= 002D Public
+  de_loop  . . . . . . . . . . .	L Near	 03B9	  _TEXT	
+  de_next  . . . . . . . . . . .	L Near	 03D8	  _TEXT	
+  de_done  . . . . . . . . . . .	L Near	 03DB	  _TEXT	
+DrawHUD  . . . . . . . . . . . .	P Near	 038C	  _TEXT	Length= 0027 Public
+  dh_ok  . . . . . . . . . . . .	L Near	 03A9	  _TEXT	
+DrawNum2 . . . . . . . . . . . .	P Near	 00E6	  _TEXT	Length= 001D Public
+DrawPlayer . . . . . . . . . . .	P Near	 03E0	  _TEXT	Length= 0024 Public
+DrawString . . . . . . . . . . .	P Near	 00D1	  _TEXT	Length= 0015 Public
+  ds_loop  . . . . . . . . . . .	L Near	 00D4	  _TEXT	
+  ds_done  . . . . . . . . . . .	L Near	 00E2	  _TEXT	
+GameOverScreen . . . . . . . . .	P Near	 04AC	  _TEXT	Length= 006C Public
+  gos_ok . . . . . . . . . . . .	L Near	 04D6	  _TEXT	
+  gos_wait . . . . . . . . . . .	L Near	 04E7	  _TEXT	
+  gos_restart  . . . . . . . . .	L Near	 0507	  _TEXT	
+  gos_quit . . . . . . . . . . .	L Near	 050E	  _TEXT	
+  gos_done . . . . . . . . . . .	L Near	 0513	  _TEXT	
+HandleInput  . . . . . . . . . .	P Near	 0103	  _TEXT	Length= 0067 Public
+  hi_loop  . . . . . . . . . . .	L Near	 0104	  _TEXT	
+  hi_left  . . . . . . . . . . .	L Near	 0130	  _TEXT	
+  hi_right . . . . . . . . . . .	L Near	 013D	  _TEXT	
+  hi_fire  . . . . . . . . . . .	L Near	 014A	  _TEXT	
+  hi_quit  . . . . . . . . . . .	L Near	 0163	  _TEXT	
+  hi_done  . . . . . . . . . . .	L Near	 0168	  _TEXT	
+HideCursor . . . . . . . . . . .	P Near	 0063	  _TEXT	Length= 000C Public
+MoveEnemies  . . . . . . . . . .	P Near	 01A9	  _TEXT	Length= 0041 Public
+  me_check_min . . . . . . . . .	L Near	 01D5	  _TEXT	
+  me_store . . . . . . . . . . .	L Near	 01E4	  _TEXT	
+  me_done  . . . . . . . . . . .	L Near	 01E7	  _TEXT	
+PutChar  . . . . . . . . . . . .	P Near	 00AA	  _TEXT	Length= 0027 Public
+Rand . . . . . . . . . . . . . .	P Near	 01EA	  _TEXT	Length= 0013 Public
+RenderFrame  . . . . . . . . . .	P Near	 037C	  _TEXT	Length= 0010 Public
+ResetGame  . . . . . . . . . . .	P Near	 0313	  _TEXT	Length= 0069 Public
+  rg_e . . . . . . . . . . . . .	L Near	 034E	  _TEXT	
+  rg_e_end . . . . . . . . . . .	L Near	 0360	  _TEXT	
+  rg_b . . . . . . . . . . . . .	L Near	 0362	  _TEXT	
+  rg_b_end . . . . . . . . . . .	L Near	 0379	  _TEXT	
+ShowCursor . . . . . . . . . . .	P Near	 006F	  _TEXT	Length= 000C Public
+SpawnEnemyBullet . . . . . . . .	P Near	 01FD	  _TEXT	Length= 005E Public
+  seb_find . . . . . . . . . . .	L Near	 0213	  _TEXT	
+  seb_got_slot . . . . . . . . .	L Near	 0222	  _TEXT	
+  seb_find_alive . . . . . . . .	L Near	 022D	  _TEXT	
+  seb_alive_found  . . . . . . .	L Near	 023F	  _TEXT	
+  seb_done . . . . . . . . . . .	L Near	 0256	  _TEXT	
+TitleScreen  . . . . . . . . . .	P Near	 0443	  _TEXT	Length= 0069 Public
+  ts_wait  . . . . . . . . . . .	L Near	 0486	  _TEXT	
+  ts_quit  . . . . . . . . . . .	L Near	 04A2	  _TEXT	
+  ts_done  . . . . . . . . . . .	L Near	 04A7	  _TEXT	
+UpdateEnemyBullets . . . . . . .	P Near	 0182	  _TEXT	Length= 0027 Public
+  ueb_loop . . . . . . . . . . .	L Near	 0186	  _TEXT	
+  ueb_next . . . . . . . . . . .	L Near	 01A3	  _TEXT	
+  ueb_done . . . . . . . . . . .	L Near	 01A6	  _TEXT	
+UpdatePlayerBullet . . . . . . .	P Near	 016A	  _TEXT	Length= 0018 Public
+  upb_done . . . . . . . . . . .	L Near	 0181	  _TEXT	
+WaitTick . . . . . . . . . . . .	P Near	 007B	  _TEXT	Length= 0016 Public
+  wt_loop  . . . . . . . . . . .	L Near	 007D	  _TEXT	
+main . . . . . . . . . . . . . .	P Near	 0000	  _TEXT	Length= 0063 Public
+  main_start . . . . . . . . . .	L Near	 000D	  _TEXT	
+  play_start . . . . . . . . . .	L Near	 0017	  _TEXT	
+  game_loop  . . . . . . . . . .	L Near	 001A	  _TEXT	
+  quit_game  . . . . . . . . . .	L Near	 0056	  _TEXT	
+
+
+Symbols:
+
+                N a m e                 Type     Value    Attr
+
+@CodeSize  . . . . . . . . . . .	Number	 0000h	 
+@DataSize  . . . . . . . . . . .	Number	 0000h	 
+@Interface . . . . . . . . . . .	Number	 0000h	 
+@Model . . . . . . . . . . . . .	Number	 0002h	 
+@code  . . . . . . . . . . . . .	Text   	 _TEXT
+@data  . . . . . . . . . . . . .	Text   	 DGROUP
+@fardata?  . . . . . . . . . . .	Text   	 FAR_BSS
+@fardata . . . . . . . . . . . .	Text   	 FAR_DATA
+@stack . . . . . . . . . . . . .	Text   	 DGROUP
+ATTR_EBULLET . . . . . . . . . .	Number	 000Ah	 
+ATTR_ENEMY . . . . . . . . . . .	Number	 000Ch	 
+ATTR_GOVER . . . . . . . . . . .	Number	 000Ch	 
+ATTR_HUD . . . . . . . . . . . .	Number	 000Fh	 
+ATTR_NORMAL  . . . . . . . . . .	Number	 0007h	 
+ATTR_PBULLET . . . . . . . . . .	Number	 000Bh	 
+ATTR_PLAYER  . . . . . . . . . .	Number	 000Eh	 
+ATTR_TITLE . . . . . . . . . . .	Number	 000Eh	 
+ENEMY_FIRE_RATE  . . . . . . . .	Number	 000Ch	 
+ENEMY_MOVE_RATE  . . . . . . . .	Number	 0004h	 
+ENEMY_ROW  . . . . . . . . . . .	Number	 0003h	 
+KEY_ENTER  . . . . . . . . . . .	Number	 001Ch	 
+KEY_LEFT . . . . . . . . . . . .	Number	 004Bh	 
+KEY_Q  . . . . . . . . . . . . .	Number	 0010h	 
+KEY_RIGHT  . . . . . . . . . . .	Number	 004Dh	 
+KEY_R  . . . . . . . . . . . . .	Number	 0013h	 
+KEY_SPACE  . . . . . . . . . . .	Number	 0039h	 
+NUM_EBULLETS . . . . . . . . . .	Number	 0005h	 
+NUM_ENEMIES  . . . . . . . . . .	Number	 0004h	 
+PLAYER_ROW . . . . . . . . . . .	Number	 0016h	 
+RESPAWN_FRAMES . . . . . . . . .	Number	 0036h	 
+VIDEO_SEG  . . . . . . . . . . .	Number	 B800h	 
+ebull_act  . . . . . . . . . . .	Byte	 001E	  _DATA	
+ebull_x  . . . . . . . . . . . .	Byte	 0014	  _DATA	
+ebull_y  . . . . . . . . . . . .	Byte	 0019	  _DATA	
+enemy_alive  . . . . . . . . . .	Byte	 0008	  _DATA	
+enemy_base_x . . . . . . . . . .	Byte	 0004	  _DATA	
+enemy_dir  . . . . . . . . . . .	Byte	 0011	  _DATA	
+enemy_fr_timer . . . . . . . . .	Byte	 0013	  _DATA	
+enemy_mv_timer . . . . . . . . .	Byte	 0012	  _DATA	
+enemy_ofs  . . . . . . . . . . .	Byte	 0010	  _DATA	
+enemy_resp_t . . . . . . . . . .	Byte	 000C	  _DATA	
+last_tick  . . . . . . . . . . .	Word	 0028	  _DATA	
+m_ctl1 . . . . . . . . . . . . .	Byte	 0039	  _DATA	
+m_ctl2 . . . . . . . . . . . . .	Byte	 0051	  _DATA	
+m_ctl3 . . . . . . . . . . . . .	Byte	 006A	  _DATA	
+m_ctl4 . . . . . . . . . . . . .	Byte	 007D	  _DATA	
+m_final  . . . . . . . . . . . .	Byte	 00B7	  _DATA	
+m_gover  . . . . . . . . . . . .	Byte	 00AD	  _DATA	
+m_opts . . . . . . . . . . . . .	Byte	 00C5	  _DATA	
+m_press  . . . . . . . . . . . .	Byte	 0090	  _DATA	
+m_score  . . . . . . . . . . . .	Byte	 00A5	  _DATA	
+m_title  . . . . . . . . . . . .	Byte	 002A	  _DATA	
+player_b_act . . . . . . . . . .	Byte	 0003	  _DATA	
+player_bx  . . . . . . . . . . .	Byte	 0001	  _DATA	
+player_by  . . . . . . . . . . .	Byte	 0002	  _DATA	
+player_x . . . . . . . . . . . .	Byte	 0000	  _DATA	
+rand_seed  . . . . . . . . . . .	Word	 0026	  _DATA	
+score  . . . . . . . . . . . . .	Byte	 0023	  _DATA	
+want_quit  . . . . . . . . . . .	Byte	 0024	  _DATA	
+want_restart . . . . . . . . . .	Byte	 0025	  _DATA	
+
+	   0 Warnings
+	   2 Errors
